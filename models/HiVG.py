@@ -654,25 +654,25 @@ class HiVG(nn.Module):
         print("init HiVG model...")
         if (args.model == "ViT-L/14-336"):
             print("init CLIP ViT-L/14-336")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-large-patch14-336")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip-vit-large-patch14-336")
             self.extract_vision_layer = [12, 16, 20, 24]  # v4
             self.adapt_layer = [11, 15, 19, 23]
             self.patch_size = 14
         elif (args.model == "ViT-L/14"):  # main large model
             print("init CLIP ViT-L/14")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-large-patch14")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip-vit-large-patch14")
             self.extract_vision_layer = [6, 12, 18, 24]  # final 版本
             self.adapt_layer = [] if args.warmup is True else [4, 10, 16, 22]  # large model is trained on two phrases
             self.patch_size = 14
         elif (args.model == "ViT-B/32"):
             print("init CLIP ViT-B/32")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-base-patch32")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip-vit-base-patch32")
             self.extract_vision_layer = [1, 4, 8, 12]
             self.adapt_layer = [0, 3, 7, 11]
             self.patch_size = 32
         else:  # default base model
             print("init CLIP ViT-B/16")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-base-patch16")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip-vit-base-patch16")
             """
              Note that there is no mistake here. Note that [1, 4, 8, 12], [0, 3, 7, 11] are the same layer.
              In the internal implementation of transformers, the index at vision branch [0] is the original
