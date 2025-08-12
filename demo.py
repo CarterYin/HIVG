@@ -103,6 +103,25 @@ def forward(model: Any, image: Image.Image, description: str) -> Dict:
 
     # 3) Model forward
     model.eval()
+    # 确保所有子模块都设置为eval模式
+    for module in model.modules():
+        if hasattr(module, 'training'):
+            module.training = False
+        # 特别处理dropout层
+        if hasattr(module, 'dropout') and hasattr(module.dropout, 'p'):
+            module.dropout.p = 0.0
+        if hasattr(module, 'dropout1') and hasattr(module.dropout1, 'p'):
+            module.dropout1.p = 0.0
+        if hasattr(module, 'dropout2') and hasattr(module.dropout2, 'p'):
+            module.dropout2.p = 0.0
+    
+    # 设置CLIP模型为eval模式
+    if hasattr(model, 'clip'):
+        model.clip.eval()
+        for clip_module in model.clip.modules():
+            if hasattr(clip_module, 'training'):
+                clip_module.training = False
+    
     with torch.no_grad():
         pred_box_norm, logits_per_text, logits_per_image, visu_token_similarity, seg_mask = model(nested, text_list)
 
@@ -197,7 +216,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_name: str = "Vi
         aug_crop = False
         aug_scale = False
         aug_translate = False
-        model = model_name
+        model = 'CLIP-VG'  # 固定值
         model_name = 'CLIP-VG'
         extract_layer = 0
         warmup = False
@@ -207,21 +226,21 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_name: str = "Vi
         dropout = 0.1
         num_queries = 100
         pre_norm = False
-        imsize = imsize
-        emb_size = 512
+        imsize = 224  # 固定值
+        emb_size = 768
         use_vl_type_embed = False
         vl_dropout = 0.1
         vl_nheads = 8
-        vl_hidden_dim = 512 if model_name.startswith('ViT-B') else 768
+        vl_hidden_dim = 512  # 使用base模型配置以匹配checkpoint
         vl_dim_feedforward = 2048
         vl_enc_layers = 6
         vl_dec_layers = 6
         data_root = './data/image_data/'
         split_root = './data/pseudo_samples/'
-        dataset = dataset
+        dataset = 'referit'  # 固定值
         max_query_len = 77
         output_dir = './outputs'
-        device = device
+        device = 'cuda'  # 固定值
         seed = 13
         resume = ''
         detr_model = './saved_models/detr-r50.pth'
@@ -245,14 +264,51 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_name: str = "Vi
         enable_adaptive_weights = True
 
     args = SimpleArgs()
+    
+    # 在创建args后设置动态值
+    args.model = model_name
+    args.imsize = imsize
+    args.dataset = dataset
+    args.device = device
+    
     model = build_model(args)
     model.to(torch.device(device))
+    
+    # 设置随机种子以确保结果一致性
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # 设置更严格的确定性
+    torch.use_deterministic_algorithms(True)
+    torch.set_float32_matmul_precision('high')
+    
+    # 设置环境变量
+    import os
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    os.environ['PYTHONHASHSEED'] = str(args.seed)
 
     if checkpoint_path and os.path.isfile(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location='cpu')
-        state = ckpt.get('model', ckpt)
-        missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
-        print(f"Loaded checkpoint from {checkpoint_path}. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+        try:
+            # 尝试使用weights_only=True加载
+            ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+            state = ckpt.get('model', ckpt)
+            missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
+            print(f"Loaded checkpoint from {checkpoint_path}. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+        except Exception as e:
+            print(f"Warning: Failed to load checkpoint with weights_only=True: {e}")
+            print("Trying to load with weights_only=False (less secure but may work)...")
+            try:
+                # 如果weights_only=True失败，尝试weights_only=False
+                ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                state = ckpt.get('model', ckpt)
+                missing_keys, unexpected_keys = model.load_state_dict(state, strict=False)
+                print(f"Loaded checkpoint from {checkpoint_path} with weights_only=False. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+            except Exception as e2:
+                print(f"Warning: Failed to load checkpoint: {e2}")
+                print("Running with randomly initialized fusion head.")
     else:
         print("Warning: checkpoint not provided or not found. Running with randomly initialized fusion head.")
 

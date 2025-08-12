@@ -19,9 +19,10 @@ import numpy as np
 
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
-if 0.7 > float(torchvision.__version__[:3]) > 0.1:
-    from torchvision.ops import _new_empty_tensor
-    from torchvision.ops.misc import _output_size
+# 新版本torchvision中这些函数已经被移除，我们直接使用torch.nn.functional
+# if 0.7 > float(torchvision.__version__[:3]) > 0.1:
+#     from torchvision.ops import _new_empty_tensor
+#     from torchvision.ops.misc import _output_size
 
 
 class SmoothedValue(object):
@@ -517,17 +518,22 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     This will eventually be supported natively by PyTorch, and this
     class can go away.
     """
-    if float(torchvision.__version__[:3]) < 0.7:
-        if input.numel() > 0:
-            return torch.nn.functional.interpolate(
-                input, size, scale_factor, mode, align_corners
-            )
-
-        output_shape = _output_size(2, input, size, scale_factor)
-        output_shape = list(input.shape[:-2]) + list(output_shape)
-        return _new_empty_tensor(input, output_shape)
+    # 新版本PyTorch已经原生支持空batch size的interpolate
+    if input.numel() > 0:
+        return torch.nn.functional.interpolate(
+            input, size, scale_factor, mode, align_corners
+        )
+    
+    # 处理空tensor的情况
+    if size is not None:
+        output_shape = list(input.shape[:-2]) + list(size)
+    elif scale_factor is not None:
+        output_shape = list(input.shape[:-2]) + [int(input.shape[-2] * scale_factor), int(input.shape[-1] * scale_factor)]
     else:
-        return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
+        output_shape = input.shape
+    
+    # 创建空的输出tensor
+    return torch.empty(output_shape, dtype=input.dtype, device=input.device)
 
 
 def mdetr_interpolate(input, size=None, scale_factor=None, mode="nearest", align_corners=None):

@@ -34,7 +34,7 @@ conda install -c conda-forge pyarrow=14.0.2
 ## 2. Huggingface
 
 ```bash
-pip install -U huggingface_hub
+pip install -U "huggingface_hub[cli]"
 ```
 设置国内镜像站
 ```bash
@@ -57,6 +57,10 @@ hf download openai/clip-vit-base-patch32
 hf download openai/clip-vit-base-patch16        
 ```
 
+```bash
+hf download openai/clip-vit-base-patch16 --local-dir pretrained/clip-vit-base-patch16
+```
+
 下载预训练权重文件到本地电脑
 
 https://drive.google.com/file/d/1vM_568M7DwnYmjEiJgXRnrDL5UT65CGJ/view
@@ -76,5 +80,13 @@ scp -r finetuning_base yinchao@i*****:/home/yinchao/HiVG/
 
 
 ## 3. 运行
+
+```bash
+conda activate hivg_new && python demo.py --input_image_path image/vg2.jpg --prompt "the cake on the left" --output_image_path image/result_cake_left.jpg --checkpoint ./finetuning_base/referit/best_checkpoint.pth --device cuda --dataset referit
+```
+
+```bash
+conda activate hivg_new && python demo.py --input_image_path image/vg2.jpg --prompt "the cake on the right" --output_image_path image/result_cake_right.jpg --checkpoint ./finetuning_base/referit/best_checkpoint.pth --device cuda --dataset referit
+```
 
 

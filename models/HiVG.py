@@ -654,25 +654,25 @@ class HiVG(nn.Module):
         print("init HiVG model...")
         if (args.model == "ViT-L/14-336"):
             print("init CLIP ViT-L/14-336")
-            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip-vit-large-patch14-336")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip/clip-vit-large-patch14-336")
             self.extract_vision_layer = [12, 16, 20, 24]  # v4
             self.adapt_layer = [11, 15, 19, 23]
             self.patch_size = 14
         elif (args.model == "ViT-L/14"):  # main large model
             print("init CLIP ViT-L/14")
-            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip-vit-large-patch14")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip/clip-vit-large-patch14")
             self.extract_vision_layer = [6, 12, 18, 24]  # final 版本
             self.adapt_layer = [] if args.warmup is True else [4, 10, 16, 22]  # large model is trained on two phrases
             self.patch_size = 14
         elif (args.model == "ViT-B/32"):
             print("init CLIP ViT-B/32")
-            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip-vit-base-patch32")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip/clip-vit-base-patch32")
             self.extract_vision_layer = [1, 4, 8, 12]
             self.adapt_layer = [0, 3, 7, 11]
             self.patch_size = 32
         else:  # default base model
             print("init CLIP ViT-B/16")
-            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip-vit-base-patch16")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/pretrained/clip/clip-vit-base-patch16")
             """
              Note that there is no mistake here. Note that [1, 4, 8, 12], [0, 3, 7, 11] are the same layer.
              In the internal implementation of transformers, the index at vision branch [0] is the original
@@ -731,34 +731,35 @@ class HiVG(nn.Module):
         self.hidden_dim = self.clip.projection_dim  # base model 512，large model 768
         self.imsize = args.imsize
         clip_visu_hidden_dim = self.clip.vision_model.config.hidden_size  # 768
-        self.visu_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        # 修改投影层输出维度以匹配vl_hidden_dim
+        self.visu_proj = nn.Linear(self.hidden_dim, args.vl_hidden_dim)
         self.condition_text_proj = nn.Linear(self.hidden_dim, clip_visu_hidden_dim)  # clip vision 768
         self.ml_text_feat_perceiver = nn.Linear(self.clip.text_embed_dim * len(self.extract_text_layer), clip_visu_hidden_dim)
-        self.text_proj = nn.Linear(self.hidden_dim, self.hidden_dim)  # clip vision 768
-        self.reg_token = nn.Embedding(1, self.hidden_dim)
+        self.text_proj = nn.Linear(self.hidden_dim, args.vl_hidden_dim)  # 修改为vl_hidden_dim
+        self.reg_token = nn.Embedding(1, args.vl_hidden_dim)  # 修改为vl_hidden_dim
 
         # divisor = 16
         self.num_visu_token = int((args.imsize / self.patch_size) ** 2)
         self.num_text_token = args.max_query_len
         num_total = self.num_visu_token + 1 + self.num_text_token + 1  # v token + [cls]token + t token + [REG]token
-        self.vl_pos_embed = nn.Embedding(num_total, self.hidden_dim)
+        self.vl_pos_embed = nn.Embedding(num_total, args.vl_hidden_dim)  # 修改为vl_hidden_dim
 
         self.vl_transformer = build_vl_transformer(args)
 
-        self.bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
-        self.reg_pos_embed = nn.Embedding(1, self.hidden_dim)
+        self.bbox_embed = MLP(args.vl_hidden_dim, args.vl_hidden_dim, 4, 3)  # 修改为vl_hidden_dim
+        self.reg_pos_embed = nn.Embedding(1, args.vl_hidden_dim)  # 修改为vl_hidden_dim
         self.condition_text_pos_embed = nn.Embedding(self.num_text_token, clip_visu_hidden_dim)
         self.ml_visual_projection = nn.Linear(len(self.extract_vision_layer) * self.clip.vision_model.config.hidden_size,
                                               self.hidden_dim)
         self.ml_visual_projection.weight = nn.Parameter(torch.cat([self.clip.visual_projection.weight for i
                                                                    in range(len(self.extract_vision_layer))], dim=1))
 
-        self.visu_token_norm = nn.LayerNorm(self.hidden_dim, eps=1e-05)  # 512, eps=1e-05
-        self.visu_token_mlp = TOKEN_MLP(self.hidden_dim, 3072)  # 3072
+        self.visu_token_norm = nn.LayerNorm(args.vl_hidden_dim, eps=1e-05)  # 修改为vl_hidden_dim
+        self.visu_token_mlp = TOKEN_MLP(args.vl_hidden_dim, 3072)  # 修改为vl_hidden_dim
 
         # TODO：Segmentation head for Referring Image Segmentation task. RIS works only when the seg mask is used.
         #  seg conv, 10GB, 14*14 --> 28*28 --> 56*56 --> 112*112
-        hidden_dim = self.hidden_dim
+        hidden_dim = args.vl_hidden_dim  # 修改为vl_hidden_dim
         self.seg_conv1 = nn.ConvTranspose2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=(2, 2), stride=(2, 2),
                                             padding=(0, 0), output_padding=(0, 0), bias=False)  # bias=False
         self.seg_conv2 = nn.ConvTranspose2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=(2, 2), stride=(2, 2),
@@ -912,8 +913,7 @@ class HiVG(nn.Module):
         image_tensors = img_data.tensors
         text_tensors, text_mask = self.encode_text(text_data, img_data.tensors.device)
 
-        clip_text_features = self.clip.text_model(text_tensors, output_attentions=True, output_hidden_states=True,
-                                                  return_dict=True)  # B * 77 * 512
+        clip_text_features = self.clip.text_model(text_tensors, output_attentions=False, output_hidden_states=True)  # B * 77 * 512
         text_features = self.clip.text_projection(clip_text_features.last_hidden_state)
         text_eos_embed = self.clip.text_projection(clip_text_features.pooler_output)  # torch.Size([64, 512])
 
@@ -928,9 +928,8 @@ class HiVG(nn.Module):
         reg_src = self.reg_token.weight.unsqueeze(0).repeat(batch_size, 1, 1)  # B * 1 * hidden_dim
 
         clip_image_features = self.clip.vision_model(self.adapt_layer, ml_text_features, reg_src, image_tensors,
-                                                     output_attentions=True, output_hidden_states=True,
-                                                     return_dict=True)  # B * 197 * 512
-        attention_map = clip_image_features["attentions"]  # tuple, used for draw the attention map
+                                                     output_attentions=False, output_hidden_states=True)  # B * 197 * 512
+        # attention_map = clip_image_features["attentions"]  # tuple, used for draw the attention map
 
         ml_image_features = [clip_image_features["hidden_states"][i] for i in self.extract_vision_layer]
         img_cls_embed = self.clip.visual_projection(clip_image_features["pooler_output"])  # torch.Size([64, 512])
