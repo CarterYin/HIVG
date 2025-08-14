@@ -1,5 +1,6 @@
 import argparse
 import os
+import gc
 from typing import Any, Dict, Tuple
 
 import torch
@@ -33,7 +34,7 @@ def _to_tensor(pil_image: Image.Image) -> torch.Tensor:
     return tensor
 
 
-def _normalize(t: torch.Tensor, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)) -> torch.Tensor:
+def _normalize(t: torch.Tensor, mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)) -> torch.Tensor:
     assert t.ndim == 3 and t.shape[0] == 3
     mean_t = torch.tensor(mean, dtype=t.dtype, device=t.device)[:, None, None]
     std_t = torch.tensor(std, dtype=t.dtype, device=t.device)[:, None, None]
@@ -73,7 +74,7 @@ def _xywh_norm_to_xyxy_pixels(box_xywh_norm: torch.Tensor, W: int, H: int) -> to
     return torch.stack([x0, y0, x1, y1], dim=-1)
 
 
-def forward(model: Any, image: Image.Image, description: str) -> Dict:
+def forward(model: Any, image: Image.Image, description: str, norm: str = "clip", tta_flip: bool = False, mask_activation: str = "sigmoid") -> Dict:
     """
     Single-image inference. Returns a dict with fields ready for visualization on the original image size.
 
@@ -85,88 +86,110 @@ def forward(model: Any, image: Image.Image, description: str) -> Dict:
     """
     model_device = next(model.parameters()).device
 
-    # 1) Preprocess image -> resize by long side, to tensor, normalize, center-pad to square of args.imsize
+    # 1) 内部单图推理（可复用于 TTA）
+    def _infer_single(pil_img: Image.Image) -> Tuple[np.ndarray, np.ndarray, Any, Any]:
+        img_rgb = pil_img.convert("RGB")
+        imsize_local = getattr(model, 'imsize', 224)
+        resized_img, ratio = _resize_by_long_side(img_rgb, imsize_local)
+        tensor = _to_tensor(resized_img)
+        if norm == "clip":
+            tensor = _normalize(tensor, mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        else:
+            tensor = _normalize(tensor, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        padded_img, pad_mask, top, left = _center_pad_to_square(tensor, imsize_local)
+
+        model_dtype = next(model.parameters()).dtype
+        # 保持输入为 float32，由 autocast 处理到合适精度，避免半精度 Conv2d 引擎不可用
+        img_tensor_bchw = padded_img.unsqueeze(0).to(model_device)
+        mask_bhw = pad_mask.unsqueeze(0).to(model_device)
+        nested = NestedTensor(img_tensor_bchw, mask_bhw)
+
+        text_list = [description]
+
+        model.eval()
+        for module in model.modules():
+            if hasattr(module, 'training'):
+                module.training = False
+            if hasattr(module, 'dropout') and hasattr(module.dropout, 'p'):
+                module.dropout.p = 0.0
+            if hasattr(module, 'dropout1') and hasattr(module.dropout1, 'p'):
+                module.dropout1.p = 0.0
+            if hasattr(module, 'dropout2') and hasattr(module.dropout2, 'p'):
+                module.dropout2.p = 0.0
+        if hasattr(model, 'clip'):
+            model.clip.eval()
+            for clip_module in model.clip.modules():
+                if hasattr(clip_module, 'training'):
+                    clip_module.training = False
+
+        use_autocast = (model_device.type == 'cuda' and model_dtype in (torch.float16, torch.bfloat16))
+        autocast_dtype = model_dtype if model_dtype in (torch.float16, torch.bfloat16) else torch.float32
+        with torch.inference_mode():
+            if use_autocast:
+                with torch.autocast(device_type='cuda', dtype=autocast_dtype):
+                    pred_box_norm, logits_per_text, logits_per_image, visu_token_similarity, seg_mask = model(nested, text_list)
+            else:
+                pred_box_norm, logits_per_text, logits_per_image, visu_token_similarity, seg_mask = model(nested, text_list)
+
+        pred_box_norm = pred_box_norm[0].detach().cpu()
+        seg_mask_small = seg_mask[0, 0].detach().cpu()
+
+        # Box: map back to original coordinates
+        box_xyxy_padded = _xywh_norm_to_xyxy_pixels(pred_box_norm, imsize_local, imsize_local)
+        x0, y0, x1, y1 = box_xyxy_padded.tolist()
+        x0 -= left; x1 -= left
+        y0 -= top;  y1 -= top
+        resized_w, resized_h = resized_img.size
+        x0 = max(0.0, min(x0, resized_w - 1))
+        x1 = max(0.0, min(x1, resized_w - 1))
+        y0 = max(0.0, min(y0, resized_h - 1))
+        y1 = max(0.0, min(y1, resized_h - 1))
+        inv_ratio = 1.0 / ratio
+        orig_w, orig_h = pil_img.size
+        x0_orig = x0 * inv_ratio
+        y0_orig = y0 * inv_ratio
+        x1_orig = x1 * inv_ratio
+        y1_orig = y1 * inv_ratio
+        x0_orig = max(0.0, min(x0_orig, orig_w - 1))
+        x1_orig = max(0.0, min(x1_orig, orig_w - 1))
+        y0_orig = max(0.0, min(y0_orig, orig_h - 1))
+        y1_orig = max(0.0, min(y1_orig, orig_h - 1))
+        box_xyxy_orig = np.array([x0_orig, y0_orig, x1_orig, y1_orig], dtype=np.float32)
+
+        # Seg: upsample back to original
+        seg_mask_small = seg_mask_small.unsqueeze(0).unsqueeze(0)
+        seg_mask_padded = torch.nn.functional.interpolate(seg_mask_small, size=(imsize_local, imsize_local), mode='bilinear', align_corners=False)[0, 0]
+        seg_mask_resized = seg_mask_padded[top: top + resized_h, left: left + resized_w]
+        seg_mask_resized = torch.nn.functional.interpolate(seg_mask_resized.unsqueeze(0).unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0, 0]
+
+        if mask_activation == "sigmoid":
+            seg_mask_resized = torch.sigmoid(seg_mask_resized)
+        else:
+            if seg_mask_resized.max() > seg_mask_resized.min():
+                seg_mask_resized = (seg_mask_resized - seg_mask_resized.min()) / (seg_mask_resized.max() - seg_mask_resized.min())
+            else:
+                seg_mask_resized = seg_mask_resized.clamp(min=0.0, max=1.0)
+
+        seg_mask_np = seg_mask_resized.numpy().astype(np.float32)
+        return box_xyxy_orig, seg_mask_np, logits_per_text, logits_per_image
+
+    # 原图推理
     image = image.convert("RGB")
-    imsize = getattr(model, 'imsize', 224)
-    resized_img, ratio = _resize_by_long_side(image, imsize)
-    tensor = _to_tensor(resized_img)
-    tensor = _normalize(tensor)
-    padded_img, pad_mask, top, left = _center_pad_to_square(tensor, imsize)
+    box_xyxy_orig, seg_mask_np, logits_per_text, logits_per_image = _infer_single(image)
 
-    # Build NestedTensor batch of size 1
-    img_tensor_bchw = padded_img.unsqueeze(0).to(model_device)
-    mask_bhw = pad_mask.unsqueeze(0).to(model_device)
-    nested = NestedTensor(img_tensor_bchw, mask_bhw)
-
-    # 2) Text batch
-    text_list = [description]
-
-    # 3) Model forward
-    model.eval()
-    # 确保所有子模块都设置为eval模式
-    for module in model.modules():
-        if hasattr(module, 'training'):
-            module.training = False
-        # 特别处理dropout层
-        if hasattr(module, 'dropout') and hasattr(module.dropout, 'p'):
-            module.dropout.p = 0.0
-        if hasattr(module, 'dropout1') and hasattr(module.dropout1, 'p'):
-            module.dropout1.p = 0.0
-        if hasattr(module, 'dropout2') and hasattr(module.dropout2, 'p'):
-            module.dropout2.p = 0.0
-    
-    # 设置CLIP模型为eval模式
-    if hasattr(model, 'clip'):
-        model.clip.eval()
-        for clip_module in model.clip.modules():
-            if hasattr(clip_module, 'training'):
-                clip_module.training = False
-    
-    with torch.no_grad():
-        pred_box_norm, logits_per_text, logits_per_image, visu_token_similarity, seg_mask = model(nested, text_list)
-
-    # Shapes: pred_box_norm (B,4) in normalized xywh; seg_mask (B,1,H',W')
-    pred_box_norm = pred_box_norm[0].detach().cpu()
-    seg_mask_small = seg_mask[0, 0].detach().cpu()  # (H', W')
-
-    # 4) Postprocess box back to original image coordinates
-    # First map to padded canvas (imsize x imsize), then remove padding, then rescale back to original
-    box_xyxy_padded = _xywh_norm_to_xyxy_pixels(pred_box_norm, imsize, imsize)
-    # Remove padding
-    x0, y0, x1, y1 = box_xyxy_padded.tolist()
-    x0 -= left; x1 -= left
-    y0 -= top;  y1 -= top
-    # Clip to resized image frame
-    resized_w, resized_h = resized_img.size
-    x0 = max(0.0, min(x0, resized_w - 1))
-    x1 = max(0.0, min(x1, resized_w - 1))
-    y0 = max(0.0, min(y0, resized_h - 1))
-    y1 = max(0.0, min(y1, resized_h - 1))
-    # Map back to original
-    inv_ratio = 1.0 / ratio
-    orig_w, orig_h = image.size
-    x0_orig = x0 * inv_ratio
-    y0_orig = y0 * inv_ratio
-    x1_orig = x1 * inv_ratio
-    y1_orig = y1 * inv_ratio
-    # Clip to original
-    x0_orig = max(0.0, min(x0_orig, orig_w - 1))
-    x1_orig = max(0.0, min(x1_orig, orig_w - 1))
-    y0_orig = max(0.0, min(y0_orig, orig_h - 1))
-    y1_orig = max(0.0, min(y1_orig, orig_h - 1))
-    box_xyxy_orig = np.array([x0_orig, y0_orig, x1_orig, y1_orig], dtype=np.float32)
-
-    # 5) Postprocess segmentation mask back to original image size
-    # Upsample seg_mask_small -> (imsize, imsize), remove padding, resize back to original
-    seg_mask_small = seg_mask_small.unsqueeze(0).unsqueeze(0)  # 1x1xH'xW'
-    seg_mask_padded = torch.nn.functional.interpolate(seg_mask_small, size=(imsize, imsize), mode='bilinear', align_corners=False)[0, 0]
-    seg_mask_resized = seg_mask_padded[top: top + resized_h, left: left + resized_w]
-    seg_mask_resized = torch.nn.functional.interpolate(seg_mask_resized.unsqueeze(0).unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0, 0]
-    seg_mask_resized = seg_mask_resized.clamp(min=0.0)
-    # Normalize to [0,1] for visualization
-    if seg_mask_resized.max() > 0:
-        seg_mask_resized = seg_mask_resized / seg_mask_resized.max()
-    seg_mask_np = seg_mask_resized.numpy().astype(np.float32)
+    # 水平翻转 TTA
+    if tta_flip:
+        flipped = image.transpose(Image.FLIP_LEFT_RIGHT)
+        box_xyxy_f, seg_mask_np_f, _, _ = _infer_single(flipped)
+        W, _ = image.size
+        # 将翻转图的 box 映射回原图坐标
+        x0_f, y0_f, x1_f, y1_f = box_xyxy_f.tolist()
+        box_xyxy_f_unflip = np.array([W - x1_f, y0_f, W - x0_f, y1_f], dtype=np.float32)
+        # 将翻转图的 seg 水平反转回原图
+        seg_mask_np_f_unflip = seg_mask_np_f[:, ::-1].copy()
+        # 融合（平均）
+        box_xyxy_orig = (box_xyxy_orig + box_xyxy_f_unflip) / 2.0
+        seg_mask_np = (seg_mask_np + seg_mask_np_f_unflip) / 2.0
 
     result: Dict[str, Any] = {
         "box_xyxy": box_xyxy_orig,
@@ -193,7 +216,7 @@ def _draw_visualization(image: Image.Image, box_xyxy: np.ndarray, seg_mask: np.n
 
 
 def load_model(checkpoint_path: str, device: str = "cuda", model_name: str = "ViT-B/16", imsize: int = 224,
-               dataset: str = "referit") -> Any:
+               dataset: str = "referit", allow_tf32: bool = False, precision: str = "fp32") -> Any:
     """
     Build HiVG model and load pretrained checkpoint.
     The CLIP pretrained paths are defined inside models/HiVG.py.
@@ -272,7 +295,58 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_name: str = "Vi
     args.device = device
     
     model = build_model(args)
-    model.to(torch.device(device))
+    # 将模型一次性迁移到目标设备与精度，避免中途多次 cast 占用显存
+    target_device = torch.device(device)
+    precision = precision.lower()
+
+    def _cast_model_dtype(m, p: str):
+        if p == 'fp16':
+            return m.to(dtype=torch.float16)
+        if p == 'bf16':
+            return m.to(dtype=torch.bfloat16)
+        return m.to(dtype=torch.float32)
+
+    def _cleanup_cuda():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        gc.collect()
+
+    # 首次尝试使用用户指定精度
+    model = _cast_model_dtype(model, precision)
+    try:
+        model.to(target_device)
+    except RuntimeError as e:
+        if 'CUDA out of memory' in str(e) and target_device.type == 'cuda':
+            _cleanup_cuda()
+            # 依次降级精度重试
+            fallback_chain = []
+            if precision == 'fp32':
+                fallback_chain = ['bf16', 'fp16']
+            elif precision == 'bf16':
+                fallback_chain = ['fp16']
+            elif precision == 'fp16':
+                fallback_chain = []
+            moved = False
+            for p in fallback_chain:
+                try:
+                    model = _cast_model_dtype(model, p)
+                    model.to(target_device)
+                    print(f"Warning: CUDA OOM. Fallback to precision={p} succeeded.")
+                    moved = True
+                    break
+                except RuntimeError as e2:
+                    if 'CUDA out of memory' not in str(e2):
+                        raise
+                    _cleanup_cuda()
+            if not moved:
+                # 最终退回 CPU
+                print("Warning: CUDA OOM. Falling back to CPU device.")
+                model = _cast_model_dtype(model, 'fp32')
+                model.to(torch.device('cpu'))
+        else:
+            raise
     
     # 设置随机种子以确保结果一致性
     torch.manual_seed(args.seed)
@@ -282,8 +356,21 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_name: str = "Vi
     torch.backends.cudnn.benchmark = False
     
     # 设置更严格的确定性
-    torch.use_deterministic_algorithms(True)
-    torch.set_float32_matmul_precision('high')
+    # 半精度下，过于严格的确定性可能导致某些算子不可用
+    use_strict_det = precision not in ('fp16', 'bf16')
+    torch.use_deterministic_algorithms(use_strict_det)
+    try:
+        torch.set_float32_matmul_precision('highest')
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+            torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+        except Exception:
+            pass
+        # 启用 cudnn benchmark 以选择可用最优实现（对半精度/不同输入大小更稳妥）
+        torch.backends.cudnn.benchmark = True
     
     # 设置环境变量
     import os
@@ -326,12 +413,17 @@ def main():
     parser.add_argument('--model', type=str, default='ViT-B/16', choices=['ViT-B/16', 'ViT-B/32', 'ViT-L/14', 'ViT-L/14-336'])
     parser.add_argument('--imsize', type=int, default=224)
     parser.add_argument('--dataset', type=str, default='referit', choices=['referit', 'flickr', 'unc', 'unc+', 'gref', 'gref_umd', 'mixup'])
+    parser.add_argument('--norm', type=str, default='clip', choices=['clip', 'imagenet'])
+    parser.add_argument('--tta_flip', action='store_true')
+    parser.add_argument('--mask_activation', type=str, default='sigmoid', choices=['sigmoid', 'none'])
+    parser.add_argument('--allow_tf32', action='store_true')
+    parser.add_argument('--precision', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'])
     args = parser.parse_args()
 
-    model = load_model(args.checkpoint, device=args.device, model_name=args.model, imsize=args.imsize, dataset=args.dataset)
+    model = load_model(args.checkpoint, device=args.device, model_name=args.model, imsize=args.imsize, dataset=args.dataset, allow_tf32=args.allow_tf32, precision=args.precision)
 
     pil_image = Image.open(args.input_image_path).convert('RGB')
-    outputs = forward(model, pil_image, args.prompt)
+    outputs = forward(model, pil_image, args.prompt, norm=args.norm, tta_flip=args.tta_flip, mask_activation=args.mask_activation)
 
     vis = _draw_visualization(pil_image, outputs['box_xyxy'], outputs['seg_mask'])
     os.makedirs(os.path.dirname(args.output_image_path) or '.', exist_ok=True)

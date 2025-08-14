@@ -89,4 +89,7 @@ conda activate hivg_new && python demo.py --input_image_path image/vg2.jpg --pro
 conda activate hivg_new && python demo.py --input_image_path image/vg2.jpg --prompt "the cake on the right" --output_image_path image/result_cake_right.jpg --checkpoint ./finetuning_base/referit/best_checkpoint.pth --device cuda --dataset referit
 ```
 
-
+## 4. 结果
+![原图](image/vg2.jpg "原图")
+![左边蛋糕](image/result_cake_left.jpg "左边蛋糕")
+![右边蛋糕](image/result_cake_right.jpg "右边蛋糕")
