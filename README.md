@@ -90,10 +90,10 @@ conda activate hivg_new && python demo.py --input_image_path image/vg2.jpg --pro
 ```
 
 ## 4. 结果
-![原图](image/vg2.jpg "原图")
+<!-- ![原图](image/vg2.jpg "原图")
 ![左边蛋糕](image/result_cake_left.jpg "左边蛋糕")
-![右边蛋糕](image/result_cake_right.jpg "右边蛋糕")
+![右边蛋糕](image/result_cake_right.jpg "右边蛋糕") -->
 
-| 左侧结果 | 中间结果 | 右侧结果 |
+| 左侧蛋糕识别结果 | 原图 | 右侧蛋糕识别结果 |
 | :--: | :--: | :--: |
 | <img src="image/result_cake_left.jpg" alt="左侧蛋糕识别结果" width="260"> | <img src="image/vg2.jpg" alt="原图" width="260"> | <img src="image/result_cake_right.jpg" alt="右侧蛋糕识别结果" width="260"> |
