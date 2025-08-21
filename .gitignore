@@ -127,3 +127,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# HiVG
+clip/
+mixup_pretraining_large/
+finetuning_large/

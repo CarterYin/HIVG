@@ -388,7 +388,13 @@ class CLIPEncoderLayer_with_Crossmodal_Bridge(nn.Module):
             self.cross_attn = CLIP_Cross_Attention(config)
             self.cross_mlp = CLIPMLP(config)
 
-            text_embed_dim = text_config.hidden_size  # 512 for base model, 768 for Large model
+            # 根据mixup_pretrain模式选择正确的text embedding维度
+            if hasattr(args, 'mixup_pretrain') and args.mixup_pretrain:
+                # 在mixup_pretrain模式下，文本特征被投影到vision hidden dim
+                text_embed_dim = config.hidden_size  # vision hidden size (1024 for ViT-L/14)
+            else:
+                text_embed_dim = text_config.hidden_size  # 512 for base model, 768 for Large model
+                
             self.cross_gate = nn.Linear(text_embed_dim * len(extract_text_layer), self.embed_dim)  # clip vision 768
             self.cross_adaptive_weights = nn.ModuleList([nn.Embedding(77, text_embed_dim) for i in range(len(extract_text_layer))])
 
@@ -654,25 +660,28 @@ class HiVG(nn.Module):
         print("init HiVG model...")
         if (args.model == "ViT-L/14-336"):
             print("init CLIP ViT-L/14-336")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-large-patch14-336")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/clip/clip-vit-large-patch14-336")
             self.extract_vision_layer = [12, 16, 20, 24]  # v4
             self.adapt_layer = [11, 15, 19, 23]
             self.patch_size = 14
         elif (args.model == "ViT-L/14"):  # main large model
             print("init CLIP ViT-L/14")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-large-patch14")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/clip/clip-vit-large-patch14")
             self.extract_vision_layer = [6, 12, 18, 24]  # final 版本
             self.adapt_layer = [] if args.warmup is True else [4, 10, 16, 22]  # large model is trained on two phrases
             self.patch_size = 14
+            # # 修复维度配置
+            # self.text_hidden_size = 768  # CLIP ViT-L/14文本维度
+            # self.vision_hidden_size = 1024  # CLIP ViT-L/14视觉维度
         elif (args.model == "ViT-B/32"):
             print("init CLIP ViT-B/32")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-base-patch32")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/clip/clip-vit-base-patch32")
             self.extract_vision_layer = [1, 4, 8, 12]
             self.adapt_layer = [0, 3, 7, 11]
             self.patch_size = 32
         else:  # default base model
             print("init CLIP ViT-B/16")
-            self.clip = CLIPModel.from_pretrained("/path_to_clip/clip-vit-base-patch16")
+            self.clip = CLIPModel.from_pretrained("/home/yinchao/HiVG/clip/clip-vit-base-patch16")
             """
              Note that there is no mistake here. Note that [1, 4, 8, 12], [0, 3, 7, 11] are the same layer.
              In the internal implementation of transformers, the index at vision branch [0] is the original
